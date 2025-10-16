@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>FretGrid — Minimal Fretboard Trainer</title>
+<style>
+  :root { --bg:#0c0c0c; --fg:#e6e6e6; --muted:#a8a8a8; --ok:#1b5e20; --bad:#7f1d1d; --hint:#2a2a2a; --wire:#6b6b6b; --cell:#151515; --focus:#2d2d2d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .wrap { max-width: 980px; margin: 20px auto; padding: 0 12px; }
+  header { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .title { font-weight:700; }
+  .controls { display:flex; gap:8px; align-items:center; }
+  select, button { background:#101010; color:var(--fg); border:1px solid #333; border-radius:8px; padding:6px 10px; cursor:pointer; }
+  button:hover, select:hover { background:#171717; }
+  .board { border:1px solid #333; border-radius:12px; overflow:hidden; }
+  .grid { display:grid; grid-template-columns: 60px repeat(12, 1fr); }
+  .row { display: contents; }
+  .string-label { display:grid; place-items:center; height:44px; border-right:1px solid #2a2a2a; color:var(--muted); background:#0f0f0f; }
+  .cell { height:44px; display:grid; place-items:center; position:relative; background:var(--cell); border-left:1px solid #141414; outline:none; }
+  .cell .ans { position:absolute; right:6px; bottom:4px; font-weight:700; opacity:.9; font-size:12px; }
+  .cell .hint { position:absolute; left:6px; top:4px; color:var(--muted); font-size:12px; }
+  .cell.focused { background:var(--focus); box-shadow: inset 0 0 0 2px #3a3a3a; }
+  .cell.correct { background: rgba(27,94,32,.25); }
+  .cell.incorrect { background: rgba(127,29,29,.25); }
+  .wire { grid-column:1/-1; height:2px; background:var(--wire); align-self:center; }
+  .cmdbar { display:flex; align-items:center; gap:8px; margin-top:10px; padding:8px; border:1px solid #333; border-radius:10px; background:#101010; }
+  .cmdbar label { color:var(--muted); }
+  .cmdbar input { flex:1; background:#0c0c0c; color:var(--fg); border:1px solid #333; border-radius:8px; padding:8px 10px; }
+  .legend { color:var(--muted); font-size:12px; margin-top:6px; }
+  .pill { padding:2px 8px; border:1px solid #333; border-radius:999px; color:var(--muted); }
+  footer { margin-top:12px; color:var(--muted); font-size:12px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="title">FretGrid <span class="pill">E A D G B E · 12 frets</span></div>
+    <div class="controls">
+      <button id="toggleHints" title="H">Hints</button>
+      <select id="accMode" title="Hint spelling">
+        <option value="sharps" selected>Sharps</option>
+        <option value="flats">Flats</option>
+      </select>
+      <button id="reset">Reset</button>
+    </div>
+  </header>
+
+  <div class="board"><div id="grid" class="grid"></div></div>
+
+  <div class="cmdbar">
+    <label for="cmd">Note:</label>
+    <input id="cmd" placeholder="Type C, C#, Db, Bb ... then press Enter" autocomplete="off" />
+    <span class="legend">Arrows move • Enter checks • H toggles hints</span>
+  </div>
+
+  <footer>
+    <div>Enharmonics accepted (A# = Bb). Frets: 1–12 (no open strings).</div>
+    <div><a href="https://ko-fi.com/yourname" target="_blank" rel="noopener" style="color:#9ad;">Ko-fi</a></div>
+  </footer>
+</div>
+
+<script>
+(function(){
+  // --- Music helpers ---
+  const SHARPS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const FLATS  = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"];
+  const NAME_TO_INDEX = {
+    "C":0,"B#":0,"C#":1,"DB":1,"Db":1,"D":2,"D#":3,"EB":3,"Eb":3,"E":4,"FB":4,"Fb":4,"F":5,"E#":5,
+    "F#":6,"GB":6,"Gb":6,"G":7,"G#":8,"AB":8,"Ab":8,"A":9,"A#":10,"BB":10,"Bb":10,"B":11,"CB":11,"Cb":11
+  };
+  const STR_OPEN = [4,11,7,2,9,4]; // E B G D A E (top → bottom)
+  const STR_LABELS = ["E","B","G","D","A","E"];
+  const FRET_COUNT = 12;
+
+  // --- State ---
+  let focus = { s:0, f:1 };      // current focused cell (0..5, 1..12)
+  let showHints = false;
+  let hintMode = "sharps";
+  const attempts = loadAttempts(); // {"s-f": {answerIdx, correct}}
+
+  const grid = document.getElementById("grid");
+  buildGrid();
+  paintAll();
+
+  // Controls
+  document.getElementById("toggleHints").addEventListener("click", ()=>{ showHints=!showHints; paintAll(); });
+  document.getElementById("accMode").addEventListener("change", e=>{ hintMode=e.target.value; paintAll(); });
+  document.getElementById("reset").addEventListener("click", ()=>{ clearAttempts(); paintAll(); });
+  const cmd = document.getElementById("cmd");
+  cmd.addEventListener("keydown", (e)=>{
+    if(e.key === "Enter"){
+      const norm = normalize(cmd.value);
+      cmd.value = "";
+      if(norm == null){ // small pulse
+        grid.classList.add("shake"); setTimeout(()=>grid.classList.remove("shake"), 120);
+        return;
+      }
+      const ansIdx = NAME_TO_INDEX[norm];
+      grade(focus.s, focus.f, ansIdx);
+      moveNext(); // optional: auto-advance
+    }
+  });
+
+  // Keyboard navigation on page
+  window.addEventListener("keydown", (e)=>{
+    if (document.activeElement === cmd) {
+      if (e.key === "Escape") { cmd.blur(); return; }
+      return; // when typing note, don't move focus
+    }
+    if (e.key === "h" || e.key === "H") { showHints=!showHints; paintAll(); return; }
+    if (e.key === "Enter") { cmd.focus(); return; }
+    if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","j","k","h","l"].includes(e.key)) {
+      e.preventDefault();
+      if (e.key==="ArrowLeft"||e.key==="h") focus.f = clamp(focus.f-1, 1, FRET_COUNT);
+      if (e.key==="ArrowRight"||e.key==="l") focus.f = clamp(focus.f+1, 1, FRET_COUNT);
+      if (e.key==="ArrowUp"||e.key==="k") focus.s = clamp(focus.s-1, 0, 5);
+      if (e.key==="ArrowDown"||e.key==="j") focus.s = clamp(focus.s+1, 0, 5);
+      paintAll();
+    }
+    // Quick-type: if user presses letter outside input, send it to cmd
+    const allowed = /^[A-Ga-g#b♯♭]$/;
+    if (allowed.test(e.key)) {
+      cmd.focus();
+      // start with the pressed key
+      cmd.value = e.key;
+      // move caret to end
+      requestAnimationFrame(()=> cmd.setSelectionRange(cmd.value.length, cmd.value.length));
+    }
+  });
+
+  // Click to focus a cell
+  grid.addEventListener("click", (e)=>{
+    const cell = e.target.closest(".cell");
+    if(!cell) return;
+    focus.s = +cell.dataset.s;
+    focus.f = +cell.dataset.f;
+    paintAll();
+    cmd.focus();
+  });
+
+  // --- Functions ---
+  function buildGrid(){
+    for(let s=0; s<6; s++){
+      const row = document.createElement("div"); row.className = "row"; grid.appendChild(row);
+      const label = document.createElement("div");
+      label.className = "string-label"; label.textContent = STR_LABELS[s]; row.appendChild(label);
+
+      for(let f=1; f<=FRET_COUNT; f++){
+        const cell = document.createElement("div");
+        cell.className = "cell";
+        cell.dataset.s = s; cell.dataset.f = f;
+        cell.innerHTML = `<div class="hint"></div><div class="ans"></div>`;
+        row.appendChild(cell);
+      }
+      const wire = document.createElement("div");
+      wire.className = "wire";
+      grid.appendChild(wire);
+    }
+  }
+
+  function clamp(v, a, b){ return Math.min(b, Math.max(a, v)); }
+  function normalize(s){
+    if(!s) return null;
+    s = s.trim().toUpperCase().replaceAll("♯","#").replaceAll("♭","B");
+    return NAME_TO_INDEX.hasOwnProperty(s) ? s : null;
+  }
+  function idxToName(i, mode="sharps"){ i=((i%12)+12)%12; return mode==="flats" ? FLATS[i] : SHARPS[i]; }
+  function key(s,f){ return `${s}-${f}`; }
+  function expectedIdx(s,f){ return (STR_OPEN[s] + f) % 12; }
+
+  function grade(s,f,ansIdx){
+    const exp = expectedIdx(s,f);
+    const correct = (ansIdx%12) === exp;
+    attempts[key(s,f)] = { answerIdx: ansIdx, correct };
+    saveAttempts();
+    paintCell(s,f);
+  }
+  function moveNext(){
+    // simple: move right; wrap to next string; wrap around
+    if (focus.f < FRET_COUNT) focus.f++;
+    else { focus.f = 1; focus.s = (focus.s+1) % 6; }
+    paintAll();
+  }
+
+  function paintAll(){
+    document.querySelectorAll(".cell").forEach(c=>{
+      const s = +c.dataset.s, f = +c.dataset.f;
+      c.classList.toggle("focused", s===focus.s && f===focus.f);
+      paintCell(s,f);
+    });
+  }
+
+  function paintCell(s,f){
+    const c = document.querySelector(`.cell[data-s="${s}"][data-f="${f}"]`);
+    const k = key(s,f);
+    const exp = expectedIdx(s,f);
+    c.classList.remove("correct","incorrect");
+    if (attempts[k]) c.classList.add(attempts[k].correct ? "correct" : "incorrect");
+    c.querySelector(".ans").textContent = attempts[k] ? idxToName(attempts[k].answerIdx,"sharps") : "";
+    c.querySelector(".hint").textContent = showHints ? idxToName(exp, hintMode) : "";
+  }
+
+  function loadAttempts(){
+    try { return JSON.parse(localStorage.getItem("fretgrid_attempts")||"{}"); }
+    catch { return {}; }
+  }
+  function saveAttempts(){
+    localStorage.setItem("fretgrid_attempts", JSON.stringify(attempts));
+  }
+  function clearAttempts(){
+    for (const k in attempts) delete attempts[k];
+    saveAttempts();
+  }
+})();
+</script>
+</body>
+</html>
